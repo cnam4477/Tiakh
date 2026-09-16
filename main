@@ -1,0 +1,430 @@
+local Players         = game:GetService("Players")
+local HttpService     = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local LocalPlayer     = Players.LocalPlayer
+local hopping         = false
+local currentTryNext  = nil
+local hopStartTime    = 0
+
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1544643313683013683/soOCp0_3Scldj-IzkVrVZj8xFbWOrUo-rd7sybTjJKN-WYKtxTecuWjXO4yBq-ySLHQr"
+local TAG_ID      = "839050632828682240"
+local BLACKLIST   = { "FXUS35" }
+
+local requestFunc = (syn and syn.request)
+    or (http and http.request)
+    or http_request or request
+    or (fluxus and fluxus.request)
+
+-- ════════════════════════════════════════════════════════
+--  COLOURS
+-- ════════════════════════════════════════════════════════
+local C = {
+    START    = 0x00C851, -- emerald
+    JOIN     = 0x4E7EFF, -- indigo
+    LEAVE    = 0xFF8C00, -- amber
+    HOP      = 0xA855F7, -- violet
+    HOP_FAIL = 0xEF4444, -- red
+    THREAT   = 0xEF4444, -- red
+}
+
+local BAR = string.rep("━", 40)
+
+-- ════════════════════════════════════════════════════════
+--  HEADSHOT  (https:// via Roblox API, 3 retries)
+-- ════════════════════════════════════════════════════════
+local function getAvatar(userId)
+    for i = 1, 3 do
+        local ok, url = pcall(function()
+            local res = requestFunc({
+                Url    = ("https://thumbnails.roblox.com/v1/users/avatar-headshot"
+                    .. "?userIds=%d&size=150x150&format=Png&isCircular=false"):format(userId),
+                Method = "GET",
+            })
+            if not (res and res.Body) then return nil end
+            local d = HttpService:JSONDecode(res.Body)
+            local e = d and d.data and d.data[1]
+            if e and e.imageUrl and (not e.state or e.state == "Completed") then
+                return e.imageUrl
+            end
+        end)
+        if ok and url then return url end
+        if i < 3 then task.wait(0.8) end
+    end
+    return nil
+end
+
+-- ════════════════════════════════════════════════════════
+--  PLAYER LIST
+-- ════════════════════════════════════════════════════════
+local function playerList(exclude)
+    local t = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p ~= exclude then
+            t[#t+1] = ("▸  **%s**  `@%s`"):format(p.DisplayName, p.Name)
+        end
+    end
+    if #t == 0 then return "*Server is empty.*" end
+    local s = table.concat(t, "\n")
+    return #s > 950 and s:sub(1,947).."…" or s
+end
+
+-- ════════════════════════════════════════════════════════
+--  SEND EMBED
+-- ════════════════════════════════════════════════════════
+local function send(o)
+    task.spawn(function()
+        local thumb = o.uid and getAvatar(o.uid) or nil
+
+        local emb = {
+            color     = o.color,
+            timestamp = DateTime.now():ToIsoDate(),
+            footer    = {
+                text     = "Job ID  ╌  " .. tostring(game.JobId),
+                icon_url = "https://cdn2.steamgriddb.com/icon/1cf8996aeff521259b04b0e19f52e4d5.png",
+            },
+        }
+        if o.title  then emb.title  = o.title  end
+        if o.desc   then emb.description = o.desc end
+        if o.fields then emb.fields = o.fields  end
+        if thumb    then emb.thumbnail = { url = thumb } end
+        if o.author then
+            emb.author = {
+                name     = o.author,
+                icon_url = o.authorIcon or thumb,
+            }
+        end
+
+        local payload = { embeds = { emb } }
+        if o.ping then
+            payload.content          = "<@"..TAG_ID..">"
+            payload.allowed_mentions = { parse = { "users" } }
+        end
+
+        local ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
+        if not ok then warn("[WH] encode:", body) return end
+
+        local rok, res = pcall(requestFunc, {
+            Url     = WEBHOOK_URL,
+            Method  = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = body,
+        })
+        if not rok then
+            warn("[WH]", res)
+        elseif res and res.StatusCode and res.StatusCode >= 400 then
+            warn("[WH] HTTP", res.StatusCode, res.Body)
+        end
+    end)
+end
+
+-- ════════════════════════════════════════════════════════
+--  KILL OTHER SCRIPTS  (exploit threads + injected LocalScripts)
+-- ════════════════════════════════════════════════════════
+local function killOtherScripts()
+    local myThread = coroutine.running()
+    local killed = 0
+
+    -- method 1: cancel every live thread except ours
+    if getgc then
+        pcall(function()
+            for _, v in pairs(getgc(true)) do
+                if type(v) == "thread" and v ~= myThread then
+                    local s = coroutine.status(v)
+                    if s == "suspended" or s == "normal" then
+                        pcall(task.cancel, v)
+                        killed += 1
+                    end
+                end
+            end
+        end)
+    end
+
+    -- method 2: destroy injected LocalScript instances in PlayerGui
+    pcall(function()
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        if not gui then return end
+        for _, obj in ipairs(gui:GetDescendants()) do
+            if obj:IsA("LocalScript") then
+                pcall(function() obj:Destroy() end)
+                killed += 1
+            end
+        end
+    end)
+
+    print(("[Kill] cleaned %d object(s)"):format(killed))
+end
+
+-- ════════════════════════════════════════════════════════
+--  SERVER FETCH
+-- ════════════════════════════════════════════════════════
+local function fetchPage(cursor)
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(game.PlaceId)
+    if cursor then url = url.."&cursor="..cursor end
+    local ok, res = pcall(requestFunc, { Url = url, Method = "GET" })
+    if not ok or not res or not res.Body then return nil end
+    local ok2, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
+    return ok2 and d or nil
+end
+
+local function getCandidates()
+    local out, cursor, pages = {}, nil, 0
+    repeat
+        local d = fetchPage(cursor) pages += 1
+        if d and d.data then
+            for _, s in ipairs(d.data) do
+                if s.id ~= game.JobId and s.playing < s.maxPlayers then
+                    out[#out+1] = s
+                end
+            end
+            cursor = d.nextPageCursor
+        else break end
+    until not cursor or pages >= 5
+    table.sort(out, function(a,b) return a.playing < b.playing end)
+    local pool = {}
+    for i = 1, math.min(10, #out) do pool[i] = out[i] end
+    return pool
+end
+
+-- ════════════════════════════════════════════════════════
+--  FALLBACK HOP  (ถ้า 10 วิยังไม่ไปให้ใช้วิธีนี้แทน)
+-- ════════════════════════════════════════════════════════
+local function fallbackHop()
+    print("[Hop] 10s timeout → fallback Teleport()")
+    send({
+        title  = "Server Hop  ·  Fallback",
+        desc   = BAR.."\nPrimary method timed out after **10s**.\nUsing fallback teleport — destination will be random.\n"..BAR,
+        color  = C.HOP,
+        ping   = true,
+    })
+    -- วิธีที่ 1: Teleport ไปเซิร์ฟ random ของเกมเดิม (ไม่เลือก JobId)
+    local ok = pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LocalPlayer)
+    if not ok then
+        -- วิธีที่ 2: สร้าง teleport gui แล้วยิงผ่าน TeleportToPlaceInstance กับ JobId ใหม่ทั้งหมด
+        local newPool = getCandidates()
+        if #newPool > 0 then
+            pcall(TeleportService.TeleportToPlaceInstance, TeleportService,
+                game.PlaceId, newPool[1].id, LocalPlayer)
+        end
+    end
+end
+
+-- ════════════════════════════════════════════════════════
+--  TeleportInitFailed  → retry ทันที
+-- ════════════════════════════════════════════════════════
+TeleportService.TeleportInitFailed:Connect(function(player, result, msg)
+    if player ~= LocalPlayer or not hopping then return end
+    warn("[Hop] TeleportInitFailed:", result, msg)
+    task.wait(0.5)
+    if currentTryNext then currentTryNext() end
+end)
+
+-- ════════════════════════════════════════════════════════
+--  HOP  (primary + fallback + timeout)
+-- ════════════════════════════════════════════════════════
+local function hopToServer(reason)
+    if hopping then return end
+    hopping       = true
+    hopStartTime  = tick()
+    currentTryNext = nil
+
+    task.spawn(function()
+        local pool = getCandidates()
+
+        if #pool == 0 then
+            send({
+                title  = "Server Hop  ·  No Servers",
+                desc   = BAR.."\nNo available servers found. Retrying in 5 s…\n"..BAR,
+                color  = C.HOP_FAIL, ping = true,
+                fields = { { name = "Reason", value = reason, inline = false } },
+            })
+            task.wait(5) hopping = false hopToServer(reason)
+            return
+        end
+
+        send({
+            title  = "Server Hop  ·  Initiated",
+            desc   = BAR..("\nRelocating — **%d** candidate servers found.\n"):format(#pool)..BAR,
+            color  = C.HOP, ping = true,
+            author = ("%s  ·  @%s"):format(LocalPlayer.DisplayName, LocalPlayer.Name),
+            uid    = LocalPlayer.UserId,
+            fields = {
+                { name = "Reason",  value = reason,                          inline = false },
+                { name = "Pool",    value = tostring(#pool).." servers",     inline = true  },
+                { name = "Server",  value = "`"..game.JobId.."`",            inline = false },
+            },
+        })
+
+        local attempt, MAX = 0, 20
+
+        local function tryNext()
+            -- ──── TIMEOUT: ถ้าเกิน 10 วิให้ใช้ fallback ────
+            if tick() - hopStartTime >= 10 then
+                currentTryNext = nil
+                fallbackHop()
+                return
+            end
+
+            attempt += 1
+            if #pool == 0 or attempt > MAX then
+                send({
+                    title = "Server Hop  ·  Retrying",
+                    desc  = BAR..("\n**%d** attempts exhausted. Fetching fresh list…\n"):format(attempt-1)..BAR,
+                    color = C.HOP_FAIL, ping = true,
+                })
+                currentTryNext = nil
+                task.wait(1) hopping = false hopToServer(reason)
+                return
+            end
+
+            local idx    = math.random(1, #pool)
+            local target = table.remove(pool, idx)
+            print(("[Hop] #%d → %s (%d/%d)"):format(attempt, target.id, target.playing, target.maxPlayers))
+
+            local ok = pcall(TeleportService.TeleportToPlaceInstance,
+                TeleportService, game.PlaceId, target.id, LocalPlayer)
+            if not ok then
+                task.wait(0.3)
+                tryNext()
+            end
+        end
+
+        currentTryNext = tryNext
+        tryNext()
+    end)
+end
+
+-- ════════════════════════════════════════════════════════
+--  THREAT CHECK  (friend + blacklist)
+-- ════════════════════════════════════════════════════════
+local function isBlacklisted(p)
+    for _, n in ipairs(BLACKLIST) do
+        if p.Name:lower() == n:lower() then return true end
+    end
+    return false
+end
+
+local function checkThreats()
+    if hopping then return end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LocalPlayer then continue end
+
+        -- Blacklist
+        if isBlacklisted(p) then
+            send({
+                title  = "Blacklist  ·  Player Detected",
+                desc   = BAR..("\n**%s** is on your blacklist. Hopping immediately.\n"):format(p.DisplayName)..BAR,
+                color  = C.THREAT, ping = true, uid = p.UserId,
+                author = ("%s  ·  @%s"):format(LocalPlayer.DisplayName, LocalPlayer.Name),
+                authorIcon = getAvatar and nil,
+                fields = {
+                    { name = "Display Name", value = p.DisplayName,                      inline = true },
+                    { name = "Username",     value = "`@"..p.Name.."`",                  inline = true },
+                    { name = "User ID",      value = "`"..tostring(p.UserId).."`",       inline = true },
+                },
+            })
+            task.spawn(killOtherScripts)
+            hopToServer("Blacklisted  ·  @"..p.Name)
+            return
+        end
+
+        -- Friend
+        local ok, friend = pcall(LocalPlayer.IsFriendsWith, LocalPlayer, p.UserId)
+        if ok and friend then
+            send({
+                title  = "Friend  ·  Detected",
+                desc   = BAR..("\n**%s** is your friend. Hopping immediately.\n"):format(p.DisplayName)..BAR,
+                color  = C.THREAT, ping = true, uid = p.UserId,
+                author = ("%s  ·  @%s"):format(LocalPlayer.DisplayName, LocalPlayer.Name),
+                fields = {
+                    { name = "Display Name", value = p.DisplayName,                      inline = true },
+                    { name = "Username",     value = "`@"..p.Name.."`",                  inline = true },
+                    { name = "User ID",      value = "`"..tostring(p.UserId).."`",       inline = true },
+                },
+            })
+            task.spawn(killOtherScripts)
+            hopToServer("Friend in server  ·  @"..p.Name)
+            return
+        end
+    end
+end
+
+-- ════════════════════════════════════════════════════════
+--  SCRIPT START
+-- ════════════════════════════════════════════════════════
+send({
+    title  = "Script  ·  Online",
+    desc   = BAR..("\nNow monitoring **%s** — logging all server activity.\n"):format(game.JobId)..BAR,
+    color  = C.START,
+    author = ("%s  ·  @%s  ·  Active"):format(LocalPlayer.DisplayName, LocalPlayer.Name),
+    uid    = LocalPlayer.UserId,
+    fields = {
+        { name = "Display Name",  value = "**"..LocalPlayer.DisplayName.."**",      inline = true  },
+        { name = "Username",      value = "`@"..LocalPlayer.Name.."`",              inline = true  },
+        { name = "Place ID",      value = "`"..tostring(game.PlaceId).."`",         inline = true  },
+        { name = ("Players Online  ·  %d"):format(#Players:GetPlayers()),
+          value = playerList(), inline = false },
+    },
+})
+
+-- ════════════════════════════════════════════════════════
+--  PLAYER ADDED
+-- ════════════════════════════════════════════════════════
+Players.PlayerAdded:Connect(function(player)
+    if player == LocalPlayer then return end
+
+    -- เช็ค threat ทันที ก่อนรอ thumbnail
+    task.spawn(checkThreats)
+
+    task.wait(1.5)
+    if hopping then return end
+
+    send({
+        title  = "Player  ·  Joined",
+        desc   = BAR..("\n**%s** has connected to the server.\n"):format(player.DisplayName)..BAR,
+        color  = C.JOIN, uid = player.UserId,
+        author = ("Monitoring  ·  %s"):format(LocalPlayer.DisplayName),
+        fields = {
+            { name = "Display Name",  value = "**"..player.DisplayName.."**",           inline = true  },
+            { name = "Username",      value = "`@"..player.Name.."`",                   inline = true  },
+            { name = "User ID",       value = "`"..tostring(player.UserId).."`",        inline = true  },
+            { name = ("Players in Server  ·  %d"):format(#Players:GetPlayers()),
+              value = playerList(), inline = false },
+        },
+    })
+end)
+
+-- ════════════════════════════════════════════════════════
+--  PLAYER REMOVING
+-- ════════════════════════════════════════════════════════
+Players.PlayerRemoving:Connect(function(player)
+    if player == LocalPlayer then hopping = true return end
+    task.defer(function()
+        if hopping then return end
+        if not LocalPlayer or not LocalPlayer.Parent then return end
+        local remaining = math.max(0, #Players:GetPlayers() - 1)
+        send({
+            title  = "Player  ·  Left",
+            desc   = BAR..("\n**%s** has disconnected from the server.\n"):format(player.DisplayName)..BAR,
+            color  = C.LEAVE, uid = player.UserId,
+            author = ("Monitoring  ·  %s"):format(LocalPlayer.DisplayName),
+            fields = {
+                { name = "Display Name",  value = "**"..player.DisplayName.."**",       inline = true  },
+                { name = "Username",      value = "`@"..player.Name.."`",               inline = true  },
+                { name = "User ID",       value = "`"..tostring(player.UserId).."`",    inline = true  },
+                { name = ("Players Remaining  ·  %d"):format(remaining),
+                  value = playerList(player), inline = false },
+            },
+        })
+    end)
+end)
+
+-- ════════════════════════════════════════════════════════
+--  PERIODIC CHECK
+-- ════════════════════════════════════════════════════════
+checkThreats()
+task.spawn(function()
+    while not hopping do
+        task.wait(8)
+        checkThreats()
+    end
+end)
